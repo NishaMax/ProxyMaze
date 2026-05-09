@@ -33,13 +33,9 @@ async function probeProxy(proxy) {
       proxy.status = 'up';
       proxy.consecutive_failures = 0;
       proxy.up_count++;
-    } else if (response.status >= 500) {
+    } else {
       proxy.status = 'down';
       proxy.consecutive_failures++;
-    } else {
-      proxy.status = 'up';
-      proxy.consecutive_failures = 0;
-      proxy.up_count++;
     }
   } catch (err) {
     proxy.status = 'down';

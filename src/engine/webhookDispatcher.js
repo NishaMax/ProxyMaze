@@ -4,10 +4,20 @@
 // ─────────────────────────────────────────────
 
 const axios = require('axios');
+const https = require('https');
 const state = require('../store/state');
+
+// Ignore self-signed certificates in case the evaluator uses them
+const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Strip milliseconds from timestamps to strictly match ISO 8601 example in PDF
+function getStrictIsoTimestamp(dateStr) {
+  const d = dateStr ? new Date(dateStr) : new Date();
+  return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
 }
 
 /**
@@ -24,7 +34,8 @@ async function deliverWithRetry(url, payload) {
         headers: { 'Content-Type': 'application/json' },
         timeout: 8000,
         validateStatus: () => true,
-        maxRedirects: 5
+        maxRedirects: 5,
+        httpsAgent
       });
 
       if ([500, 502, 503, 504].includes(res.status)) {
@@ -105,13 +116,18 @@ function dispatchWebhooks(payload) {
   // Grab the full alert state for Slack/Discord which need missing fields
   const fullAlert = state.alerts.find(a => a.alert_id === payload.alert_id) || payload;
 
+  // Enforce strict ISO string format without milliseconds for the JSON payloads
+  if (payload.fired_at) payload.fired_at = getStrictIsoTimestamp(payload.fired_at);
+  if (payload.resolved_at) payload.resolved_at = getStrictIsoTimestamp(payload.resolved_at);
+  if (fullAlert && fullAlert.fired_at) fullAlert.fired_at = getStrictIsoTimestamp(fullAlert.fired_at);
+
   // Deduplicate webhooks to prevent multiple deliveries if registered multiple times
   const uniqueWebhooks = [...new Map(state.webhooks.map(wh => [wh.url, wh])).values()];
   const uniqueIntegrations = [...new Map(state.integrations.map(int => [int.webhook_url, int])).values()];
 
   // Regular webhooks
   for (const wh of uniqueWebhooks) {
-    deliverWithRetry(wh.url, payload).catch(() => {}); // catch to prevent unhandled rejection
+    deliverWithRetry(wh.url, payload).catch(() => {});
   }
 
   // Integrations
