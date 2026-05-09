@@ -83,7 +83,8 @@ async function runMonitoringCycle() {
     await Promise.all(proxies.map(proxy => probeProxy(proxy)));
 
     // Evaluate alert conditions (may fire/resolve alerts and dispatch webhooks)
-    evaluateAlerts();
+    // MUST await — webhook delivery happens inside evaluateAlerts
+    await evaluateAlerts();
 
     const downCount = proxies.filter(p => p.status === 'down').length;
     const upCount = proxies.filter(p => p.status === 'up').length;

@@ -10,4 +10,9 @@ router.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
 });
 
+// Hidden debug endpoint to verify deploy version
+router.get('/debug/version', (req, res) => {
+  res.status(200).json({ version: '3.0.0', deployed_at: new Date().toISOString() });
+});
+
 module.exports = router;

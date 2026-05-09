@@ -6,9 +6,6 @@
 const axios = require('axios');
 const state = require('../store/state');
 
-// Track all in-flight deliveries to prevent garbage collection
-const pendingDeliveries = new Set();
-
 /**
  * Sleep helper
  */
@@ -21,38 +18,39 @@ function sleep(ms) {
  * Must succeed within 60 seconds of the state transition.
  */
 async function deliverWithRetry(url, payload) {
-  const maxAttempts = 20;
-  const retryDelayMs = 1500; // 1.5s between retries → 20 * 1.5s = 30s max
+  const maxAttempts = 25;
+  const retryDelayMs = 1000; // 1s between retries → 25s max total retry time
+
+  console.log(`[Webhook] Starting delivery to ${url}`);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const res = await axios.post(url, payload, {
         headers: { 'Content-Type': 'application/json' },
-        timeout: 8000,
-        validateStatus: () => true, // Don't throw on any HTTP status
+        timeout: 5000,
+        validateStatus: () => true,
         maxRedirects: 5
       });
 
       // Transient failure — retry
       if ([500, 502, 503, 504].includes(res.status)) {
-        console.log(`[Webhook] Transient ${res.status} from ${url}, retrying (${attempt}/${maxAttempts})...`);
+        console.log(`[Webhook] Transient ${res.status} from ${url} (attempt ${attempt}/${maxAttempts})`);
         if (attempt < maxAttempts) await sleep(retryDelayMs);
         continue;
       }
 
-      // Success — any non-transient response (2xx, 3xx, 4xx)
+      // Success
       state.metrics.webhook_deliveries++;
       console.log(`[Webhook] ✅ Delivered to ${url} (status: ${res.status}, attempt: ${attempt})`);
       return true;
 
     } catch (err) {
-      // Network error (timeout, DNS, connection refused) — retry
-      console.log(`[Webhook] Network error to ${url}: ${err.message}, retrying (${attempt}/${maxAttempts})...`);
+      console.log(`[Webhook] Error to ${url}: ${err.code || err.message} (attempt ${attempt}/${maxAttempts})`);
       if (attempt < maxAttempts) await sleep(retryDelayMs);
     }
   }
 
-  console.error(`[Webhook] ❌ FAILED to deliver to ${url} after ${maxAttempts} attempts`);
+  console.error(`[Webhook] ❌ FAILED delivery to ${url} after ${maxAttempts} attempts`);
   return false;
 }
 
@@ -67,8 +65,8 @@ function formatSlackPayload(alertEvent, integration) {
   return {
     username: integration.username || 'ProxyWatch',
     text: isFired
-      ? `🚨 Alert Fired: Proxy pool failure rate (${alertEvent.failure_rate}) exceeded threshold (${alertEvent.threshold})`
-      : `✅ Alert Resolved: Alert ${alertEvent.alert_id} has been resolved`,
+      ? `Alert Fired: Proxy pool failure rate (${alertEvent.failure_rate}) exceeded threshold (${alertEvent.threshold})`
+      : `Alert Resolved: Alert ${alertEvent.alert_id} has been resolved`,
     attachments: [{
       color: isFired ? '#FF0000' : '#36A64F',
       fields: [
@@ -80,7 +78,7 @@ function formatSlackPayload(alertEvent, integration) {
         { title: 'Fired At', value: String(alertEvent.fired_at || '') }
       ],
       footer: 'ProxyMaze Alert System',
-      ts: ts // Must be integer, not float, not string
+      ts: ts
     }]
   };
 }
@@ -97,7 +95,7 @@ function formatDiscordPayload(alertEvent, integration) {
       description: isFired
         ? `Proxy pool failure rate (${alertEvent.failure_rate}) exceeded threshold (${alertEvent.threshold})`
         : `Alert ${alertEvent.alert_id} has been resolved`,
-      color: isFired ? 16711680 : 65280, // Red or Green as integer 0-16777215
+      color: isFired ? 16711680 : 65280,
       fields: [
         { name: 'Alert ID', value: String(alertEvent.alert_id || '') },
         { name: 'Failure Rate', value: String(alertEvent.failure_rate != null ? alertEvent.failure_rate : '') },
@@ -112,27 +110,23 @@ function formatDiscordPayload(alertEvent, integration) {
 
 /**
  * Dispatch an alert event to all registered webhooks and integrations.
- * All deliveries are tracked to prevent promises from being lost.
+ * Returns a Promise that resolves when ALL deliveries complete.
  */
-function dispatchWebhooks(payload) {
-  console.log(`[Webhook] Dispatching ${payload.event} to ${state.webhooks.length} webhooks, ${state.integrations.length} integrations`);
+async function dispatchWebhooks(payload) {
+  const promises = [];
+
+  console.log(`[Webhook] Dispatching ${payload.event} → ${state.webhooks.length} webhooks, ${state.integrations.length} integrations`);
 
   // Regular webhooks
   for (const wh of state.webhooks) {
-    const promise = deliverWithRetry(wh.url, payload)
-      .catch(err => console.error(`[Webhook] Delivery error: ${err.message}`))
-      .finally(() => pendingDeliveries.delete(promise));
-    pendingDeliveries.add(promise);
+    promises.push(deliverWithRetry(wh.url, payload));
   }
 
   // Slack integrations
   for (const integration of state.integrations) {
     if (integration.type === 'slack' && (!integration.events || integration.events.includes(payload.event))) {
       const slackPayload = formatSlackPayload(payload, integration);
-      const promise = deliverWithRetry(integration.webhook_url, slackPayload)
-        .catch(err => console.error(`[Slack] Delivery error: ${err.message}`))
-        .finally(() => pendingDeliveries.delete(promise));
-      pendingDeliveries.add(promise);
+      promises.push(deliverWithRetry(integration.webhook_url, slackPayload));
     }
   }
 
@@ -140,11 +134,18 @@ function dispatchWebhooks(payload) {
   for (const integration of state.integrations) {
     if (integration.type === 'discord' && (!integration.events || integration.events.includes(payload.event))) {
       const discordPayload = formatDiscordPayload(payload, integration);
-      const promise = deliverWithRetry(integration.webhook_url, discordPayload)
-        .catch(err => console.error(`[Discord] Delivery error: ${err.message}`))
-        .finally(() => pendingDeliveries.delete(promise));
-      pendingDeliveries.add(promise);
+      promises.push(deliverWithRetry(integration.webhook_url, discordPayload));
     }
+  }
+
+  // Wait for ALL deliveries to complete (or fail)
+  if (promises.length > 0) {
+    const results = await Promise.allSettled(promises);
+    const succeeded = results.filter(r => r.status === 'fulfilled' && r.value === true).length;
+    const failed = results.length - succeeded;
+    console.log(`[Webhook] Dispatch complete: ${succeeded} succeeded, ${failed} failed`);
+  } else {
+    console.log(`[Webhook] No receivers registered for ${payload.event}`);
   }
 }
 
