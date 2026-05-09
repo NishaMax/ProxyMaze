@@ -17,13 +17,24 @@ let isRunningCycle = false; // Guard against concurrent cycles
  */
 async function probeProxy(proxy) {
   const now = new Date().toISOString();
+  const timeoutMs = state.config.request_timeout_ms || 5000;
 
   try {
+    // Use AbortController for reliable timeout handling
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
     const response = await axios.get(proxy.url, {
-      timeout: state.config.request_timeout_ms,
+      timeout: timeoutMs,
+      signal: controller.signal,
       validateStatus: () => true, // Don't throw on any HTTP status
-      maxRedirects: 5
+      maxRedirects: 5,
+      // Don't try to decompress or parse response body for speed
+      responseType: 'text',
+      maxContentLength: 1024 * 10 // 10KB max, we don't need the body
     });
+
+    clearTimeout(timeoutId);
 
     if (response.status >= 200 && response.status < 300) {
       // 2xx → UP
@@ -31,7 +42,7 @@ async function probeProxy(proxy) {
       proxy.consecutive_failures = 0;
       proxy.up_count++;
     } else if (response.status >= 500) {
-      // 5xx → DOWN
+      // 5xx → DOWN (explicit server error)
       proxy.status = 'down';
       proxy.consecutive_failures++;
     } else {
@@ -41,7 +52,7 @@ async function probeProxy(proxy) {
       proxy.up_count++;
     }
   } catch (err) {
-    // Timeout, connection refused, DNS failure, etc. → DOWN
+    // Timeout, connection refused, DNS failure, abort, etc. → DOWN
     proxy.status = 'down';
     proxy.consecutive_failures++;
   }
@@ -55,7 +66,7 @@ async function probeProxy(proxy) {
 /**
  * Run one complete monitoring cycle:
  * 1. Probe all proxies concurrently
- * 2. Evaluate alert conditions
+ * 2. Evaluate alert conditions (may dispatch webhooks)
  */
 async function runMonitoringCycle() {
   if (state.proxyPool.size === 0) return;
@@ -71,11 +82,12 @@ async function runMonitoringCycle() {
     // Probe all proxies concurrently
     await Promise.all(proxies.map(proxy => probeProxy(proxy)));
 
-    // Evaluate alert conditions
+    // Evaluate alert conditions (may fire/resolve alerts and dispatch webhooks)
     evaluateAlerts();
 
     const downCount = proxies.filter(p => p.status === 'down').length;
-    console.log(`[Monitor] Cycle complete — up: ${proxies.length - downCount}, down: ${downCount}`);
+    const upCount = proxies.filter(p => p.status === 'up').length;
+    console.log(`[Monitor] Cycle complete — up: ${upCount}, down: ${downCount}, pending: ${proxies.length - upCount - downCount}`);
   } catch (err) {
     console.error(`[Monitor] Cycle error: ${err.message}`);
   } finally {
@@ -110,7 +122,8 @@ function restartMonitoringLoop() {
  * Does not restart the interval — just runs one cycle now.
  */
 function triggerImmediateCycle() {
-  runMonitoringCycle();
+  // Small delay to let the HTTP response go out first
+  setTimeout(() => runMonitoringCycle(), 100);
 }
 
 module.exports = { restartMonitoringLoop, triggerImmediateCycle };

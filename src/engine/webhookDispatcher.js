@@ -6,6 +6,9 @@
 const axios = require('axios');
 const state = require('../store/state');
 
+// Track all in-flight deliveries to prevent garbage collection
+const pendingDeliveries = new Set();
+
 /**
  * Sleep helper
  */
@@ -18,61 +21,66 @@ function sleep(ms) {
  * Must succeed within 60 seconds of the state transition.
  */
 async function deliverWithRetry(url, payload) {
-  const maxAttempts = 15;
-  const retryDelayMs = 2000;
+  const maxAttempts = 20;
+  const retryDelayMs = 1500; // 1.5s between retries → 20 * 1.5s = 30s max
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const res = await axios.post(url, payload, {
         headers: { 'Content-Type': 'application/json' },
-        timeout: 10000,
-        validateStatus: () => true // Don't throw on any HTTP status
+        timeout: 8000,
+        validateStatus: () => true, // Don't throw on any HTTP status
+        maxRedirects: 5
       });
 
       // Transient failure — retry
       if ([500, 502, 503, 504].includes(res.status)) {
         console.log(`[Webhook] Transient ${res.status} from ${url}, retrying (${attempt}/${maxAttempts})...`);
-        await sleep(retryDelayMs);
+        if (attempt < maxAttempts) await sleep(retryDelayMs);
         continue;
       }
 
-      // Success — any non-transient response
+      // Success — any non-transient response (2xx, 3xx, 4xx)
       state.metrics.webhook_deliveries++;
-      console.log(`[Webhook] Delivered to ${url} (status: ${res.status})`);
-      return;
+      console.log(`[Webhook] ✅ Delivered to ${url} (status: ${res.status}, attempt: ${attempt})`);
+      return true;
 
     } catch (err) {
       // Network error (timeout, DNS, connection refused) — retry
       console.log(`[Webhook] Network error to ${url}: ${err.message}, retrying (${attempt}/${maxAttempts})...`);
-      await sleep(retryDelayMs);
+      if (attempt < maxAttempts) await sleep(retryDelayMs);
     }
   }
 
-  console.error(`[Webhook] FAILED to deliver to ${url} after ${maxAttempts} attempts`);
+  console.error(`[Webhook] ❌ FAILED to deliver to ${url} after ${maxAttempts} attempts`);
+  return false;
 }
 
 /**
  * Format a Slack-style webhook payload
  */
 function formatSlackPayload(alertEvent, integration) {
-  const timestamp = alertEvent.fired_at || alertEvent.resolved_at;
+  const timestamp = alertEvent.fired_at || alertEvent.resolved_at || new Date().toISOString();
   const ts = Math.floor(new Date(timestamp).getTime() / 1000);
+  const isFired = alertEvent.event === 'alert.fired';
 
   return {
     username: integration.username || 'ProxyWatch',
-    text: `Alert ${alertEvent.event}: ${alertEvent.alert_id}`,
+    text: isFired
+      ? `🚨 Alert Fired: Proxy pool failure rate (${alertEvent.failure_rate}) exceeded threshold (${alertEvent.threshold})`
+      : `✅ Alert Resolved: Alert ${alertEvent.alert_id} has been resolved`,
     attachments: [{
-      color: alertEvent.event === 'alert.fired' ? '#FF0000' : '#00FF00',
+      color: isFired ? '#FF0000' : '#36A64F',
       fields: [
-        { title: 'Alert ID', value: alertEvent.alert_id || 'N/A' },
-        { title: 'Failure Rate', value: String(alertEvent.failure_rate ?? 'N/A') },
-        { title: 'Failed Proxies', value: String(alertEvent.failed_proxies ?? 'N/A') },
-        { title: 'Threshold', value: String(alertEvent.threshold ?? 0.2) },
-        { title: 'Failed IDs', value: (alertEvent.failed_proxy_ids || []).join(', ') || 'N/A' },
-        { title: 'Fired At', value: alertEvent.fired_at || 'N/A' }
+        { title: 'Alert ID', value: String(alertEvent.alert_id || '') },
+        { title: 'Failure Rate', value: String(alertEvent.failure_rate != null ? alertEvent.failure_rate : '') },
+        { title: 'Failed Proxies', value: String(alertEvent.failed_proxies != null ? alertEvent.failed_proxies : '') },
+        { title: 'Threshold', value: String(alertEvent.threshold != null ? alertEvent.threshold : '0.2') },
+        { title: 'Failed IDs', value: String((alertEvent.failed_proxy_ids || []).join(', ') || 'None') },
+        { title: 'Fired At', value: String(alertEvent.fired_at || '') }
       ],
       footer: 'ProxyMaze Alert System',
-      ts: ts
+      ts: ts // Must be integer, not float, not string
     }]
   };
 }
@@ -85,17 +93,17 @@ function formatDiscordPayload(alertEvent, integration) {
 
   return {
     embeds: [{
-      title: isFired ? '🚨 Alert Fired' : '✅ Alert Resolved',
+      title: isFired ? 'Alert Fired' : 'Alert Resolved',
       description: isFired
         ? `Proxy pool failure rate (${alertEvent.failure_rate}) exceeded threshold (${alertEvent.threshold})`
         : `Alert ${alertEvent.alert_id} has been resolved`,
-      color: isFired ? 16711680 : 65280, // Red or Green as integer
+      color: isFired ? 16711680 : 65280, // Red or Green as integer 0-16777215
       fields: [
-        { name: 'Alert ID', value: alertEvent.alert_id || 'N/A' },
-        { name: 'Failure Rate', value: String(alertEvent.failure_rate ?? 'N/A') },
-        { name: 'Failed Proxies', value: String(alertEvent.failed_proxies ?? 'N/A') },
-        { name: 'Threshold', value: String(alertEvent.threshold ?? 0.2) },
-        { name: 'Failed IDs', value: (alertEvent.failed_proxy_ids || []).join(', ') || 'N/A' }
+        { name: 'Alert ID', value: String(alertEvent.alert_id || '') },
+        { name: 'Failure Rate', value: String(alertEvent.failure_rate != null ? alertEvent.failure_rate : '') },
+        { name: 'Failed Proxies', value: String(alertEvent.failed_proxies != null ? alertEvent.failed_proxies : '') },
+        { name: 'Threshold', value: String(alertEvent.threshold != null ? alertEvent.threshold : '0.2') },
+        { name: 'Failed IDs', value: String((alertEvent.failed_proxy_ids || []).join(', ') || 'None') }
       ],
       footer: { text: 'ProxyMaze Alert System' }
     }]
@@ -104,27 +112,38 @@ function formatDiscordPayload(alertEvent, integration) {
 
 /**
  * Dispatch an alert event to all registered webhooks and integrations.
- * Runs asynchronously — does not block the monitoring loop.
+ * All deliveries are tracked to prevent promises from being lost.
  */
 function dispatchWebhooks(payload) {
+  console.log(`[Webhook] Dispatching ${payload.event} to ${state.webhooks.length} webhooks, ${state.integrations.length} integrations`);
+
   // Regular webhooks
   for (const wh of state.webhooks) {
-    deliverWithRetry(wh.url, payload);
+    const promise = deliverWithRetry(wh.url, payload)
+      .catch(err => console.error(`[Webhook] Delivery error: ${err.message}`))
+      .finally(() => pendingDeliveries.delete(promise));
+    pendingDeliveries.add(promise);
   }
 
   // Slack integrations
-  for (const integration of state.integrations.filter(i => i.type === 'slack')) {
-    if (integration.events && integration.events.includes(payload.event)) {
+  for (const integration of state.integrations) {
+    if (integration.type === 'slack' && (!integration.events || integration.events.includes(payload.event))) {
       const slackPayload = formatSlackPayload(payload, integration);
-      deliverWithRetry(integration.webhook_url, slackPayload);
+      const promise = deliverWithRetry(integration.webhook_url, slackPayload)
+        .catch(err => console.error(`[Slack] Delivery error: ${err.message}`))
+        .finally(() => pendingDeliveries.delete(promise));
+      pendingDeliveries.add(promise);
     }
   }
 
   // Discord integrations
-  for (const integration of state.integrations.filter(i => i.type === 'discord')) {
-    if (integration.events && integration.events.includes(payload.event)) {
+  for (const integration of state.integrations) {
+    if (integration.type === 'discord' && (!integration.events || integration.events.includes(payload.event))) {
       const discordPayload = formatDiscordPayload(payload, integration);
-      deliverWithRetry(integration.webhook_url, discordPayload);
+      const promise = deliverWithRetry(integration.webhook_url, discordPayload)
+        .catch(err => console.error(`[Discord] Delivery error: ${err.message}`))
+        .finally(() => pendingDeliveries.delete(promise));
+      pendingDeliveries.add(promise);
     }
   }
 }

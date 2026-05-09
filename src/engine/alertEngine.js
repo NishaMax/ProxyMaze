@@ -7,6 +7,10 @@ const crypto = require('crypto');
 const state = require('../store/state');
 const { dispatchWebhooks } = require('./webhookDispatcher');
 
+// Track which alert_ids have already had their fired webhook dispatched
+// This prevents duplicate webhook deliveries during persistent breaches
+const firedWebhooksSent = new Set();
+
 /**
  * Evaluate alert conditions after each monitoring cycle.
  * 
@@ -21,6 +25,10 @@ function evaluateAlerts() {
   const total = proxies.length;
 
   if (total === 0) return;
+
+  // Only count proxies that have been checked (not "pending")
+  const checkedProxies = proxies.filter(p => p.status === 'up' || p.status === 'down');
+  if (checkedProxies.length === 0) return; // All still pending
 
   const downCount = proxies.filter(p => p.status === 'down').length;
   const failureRate = downCount / total;
@@ -44,8 +52,9 @@ function evaluateAlerts() {
 
     state.alerts.push(alert);
     state.activeAlert = alert;
+    firedWebhooksSent.add(alert.alert_id);
 
-    console.log(`[Alert] FIRED ${alert.alert_id} — failure_rate: ${failureRate.toFixed(2)}, down: ${downCount}/${total}`);
+    console.log(`[Alert] FIRED ${alert.alert_id} — failure_rate: ${failureRate.toFixed(2)}, down: ${downCount}/${total}, failed: [${failedIds.join(', ')}]`);
 
     dispatchWebhooks({
       event: 'alert.fired',
@@ -54,24 +63,28 @@ function evaluateAlerts() {
       failure_rate: alert.failure_rate,
       total_proxies: alert.total_proxies,
       failed_proxies: alert.failed_proxies,
-      failed_proxy_ids: alert.failed_proxy_ids,
+      failed_proxy_ids: [...alert.failed_proxy_ids],
       threshold: alert.threshold,
       message: alert.message
     });
 
   } else if (failureRate >= 0.20 && state.activeAlert) {
-    // ── 🔄 Breach continues — update existing alert silently ──
+    // ── 🔄 Breach continues — update existing alert, NO new webhook ──
     state.activeAlert.failure_rate = failureRate;
     state.activeAlert.failed_proxies = downCount;
     state.activeAlert.failed_proxy_ids = [...failedIds];
     state.activeAlert.total_proxies = total;
-    // Do NOT fire another webhook. Do NOT create another alert.
+    // Absolutely do NOT dispatch another webhook or create another alert
 
   } else if (failureRate < 0.20 && state.activeAlert) {
     // ── ✅ RESOLVE ──
     const now = new Date().toISOString();
     state.activeAlert.status = 'resolved';
     state.activeAlert.resolved_at = now;
+    // Update the failed set to reflect current state (recovered)
+    state.activeAlert.failure_rate = failureRate;
+    state.activeAlert.failed_proxies = downCount;
+    state.activeAlert.failed_proxy_ids = [...failedIds];
 
     console.log(`[Alert] RESOLVED ${state.activeAlert.alert_id} — failure_rate dropped to ${failureRate.toFixed(2)}`);
 
