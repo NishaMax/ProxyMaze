@@ -14,7 +14,7 @@ router.get('/health', (req, res) => {
 
 // Debug endpoint to verify deploy version
 router.get('/debug/version', (req, res) => {
-  res.status(200).json({ version: '6.0.0', deployed_at: new Date().toISOString() });
+  res.status(200).json({ version: '7.0.0', deployed_at: new Date().toISOString() });
 });
 
 // DIAGNOSTIC: Test if Railway can make outbound POST requests

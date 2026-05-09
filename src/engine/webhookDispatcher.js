@@ -1,160 +1,133 @@
 // ─────────────────────────────────────────────
 // src/engine/webhookDispatcher.js
-// Webhook delivery with retry on transient failures
+// Webhook delivery with retry — SIMPLE AND CORRECT
 // ─────────────────────────────────────────────
 
-const axios = require('axios');
+const http = require('http');
 const https = require('https');
-const crypto = require('crypto');
 const state = require('../store/state');
-
-// Ignore self-signed certificates in case the evaluator uses them
-const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Strip milliseconds from timestamps to strictly match ISO 8601 example in PDF
-function getStrictIsoTimestamp(dateStr) {
-  const d = dateStr ? new Date(dateStr) : new Date();
-  return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
-}
+/**
+ * Native HTTP POST that does NOT follow redirects automatically.
+ * This prevents POST->GET conversion on 301/302 redirects.
+ */
+function httpPost(url, payload) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(payload);
+    const parsed = new URL(url);
+    const transport = parsed.protocol === 'https:' ? https : http;
 
-function stableStringify(obj) {
-  // Stable enough for our payload hashing needs (sorted keys)
-  if (obj === null || typeof obj !== 'object') return JSON.stringify(obj);
-  if (Array.isArray(obj)) return `[${obj.map(stableStringify).join(',')}]`;
-  const keys = Object.keys(obj).sort();
-  return `{${keys.map(k => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(',')}}`;
-}
+    const options = {
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+      path: parsed.pathname + parsed.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(data)
+      },
+      timeout: 5000
+    };
 
-function computeDeliveryKey(url, payload) {
-  const event = payload?.event || '';
-  const alertId = payload?.alert_id || '';
-  // If an event has no alert_id (shouldn't happen), fall back to hashing payload
-  const base = `${url}|${event}|${alertId || crypto.createHash('sha1').update(stableStringify(payload)).digest('hex')}`;
-  return base;
-}
-
-function isTransientStatus(status) {
-  // Evaluator expects retries on transient receiver failures (500/502/503/504),
-  // but being generous with any 5xx improves real-world reliability.
-  return typeof status === 'number' && status >= 500 && status < 600;
-}
-
-async function attemptOnce(url, payload) {
-  try {
-    const res = await axios.post(url, payload, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 8000,
-      validateStatus: () => true,
-      maxRedirects: 5,
-      httpsAgent
+    const req = transport.request(options, (res) => {
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        resolve({
+          status: res.statusCode,
+          body: body,
+          location: res.headers.location || null
+        });
+      });
     });
 
-    if (isTransientStatus(res.status)) return { ok: false, transient: true, status: res.status };
-    if (res.status >= 200 && res.status < 300) return { ok: true, transient: false, status: res.status };
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('TIMEOUT'));
+    });
 
-    // Non-transient failure: do not retry forever
-    return { ok: false, transient: false, status: res.status };
-  } catch (err) {
-    // Network/TLS/DNS/timeout => treat as transient for retry.
-    return { ok: false, transient: true, status: 0 };
-  }
-}
+    req.on('error', (err) => {
+      reject(err);
+    });
 
-function ensureDispatcherLoop() {
-  if (state._dispatcherLoopStarted) return;
-  state._dispatcherLoopStarted = true;
-
-  setInterval(async () => {
-    // Process a small batch frequently so we meet the 60s requirement.
-    const batchSize = 25;
-    const now = Date.now();
-
-    const pendingKeys = [];
-    for (const [k, job] of state.deliveryQueue.entries()) {
-      if (!job || job.status !== 'pending') continue;
-      if (job.in_flight) continue;
-      if (job.next_attempt_at_ms && job.next_attempt_at_ms > now) continue;
-      pendingKeys.push(k);
-      if (pendingKeys.length >= batchSize) break;
-    }
-
-    for (const key of pendingKeys) {
-      const job = state.deliveryQueue.get(key);
-      if (!job || job.status !== 'pending') continue;
-      if (job.in_flight) continue;
-
-      // Guard against long-lived jobs: stop trying after 60s window
-      if (Date.now() - job.created_at_ms > 60_000) {
-        state.deliveryQueue.delete(key);
-        continue;
-      }
-
-      job.in_flight = true;
-
-      const result = await attemptOnce(job.url, job.payload);
-      if (result.ok) {
-        if (!state.deliverySuccessKeys.has(key)) {
-          state.deliverySuccessKeys.add(key);
-          state.metrics.webhook_deliveries++;
-        }
-        // Remove job after success to avoid any future processing
-        state.deliveryQueue.delete(key);
-      } else if (result.transient) {
-        job.attempts++;
-        job.next_attempt_at_ms = Date.now() + 1500;
-        job.in_flight = false;
-      } else {
-        // Terminal failure; remove so it can't deliver duplicates later
-        state.deliveryQueue.delete(key);
-      }
-    }
-  }, 250);
-}
-
-function enqueueDelivery(url, payload) {
-  ensureDispatcherLoop();
-
-  const key = computeDeliveryKey(url, payload);
-  if (state.deliverySuccessKeys.has(key)) return;
-  if (state.deliveryQueue.has(key)) return;
-
-  state.deliveryQueue.set(key, {
-    url,
-    payload,
-    created_at_ms: Date.now(),
-    next_attempt_at_ms: Date.now(),
-    attempts: 0,
-    status: 'pending',
-    in_flight: false
+    req.write(data);
+    req.end();
   });
 }
 
 /**
- * Format a Slack-style webhook payload (legacy attachments format per challenge spec)
+ * Deliver payload to URL. Retry on 5xx. Stop after 45 seconds max.
  */
-function formatSlackPayload(payload, fullAlert, integration) {
-  const timestamp = payload.fired_at || payload.resolved_at || fullAlert.fired_at || new Date().toISOString();
-  const ts = Math.floor(new Date(timestamp).getTime() / 1000);
-  const isFired = payload.event === 'alert.fired';
+async function deliverWithRetry(url, payload) {
+  const deadline = Date.now() + 45000; // 45s hard deadline
+
+  for (let attempt = 1; attempt <= 30; attempt++) {
+    if (Date.now() > deadline) {
+      console.log(`[WH] DEADLINE exceeded for ${url}`);
+      return false;
+    }
+
+    try {
+      const result = await httpPost(url, payload);
+
+      if (result.status >= 200 && result.status < 300) {
+        console.log(`[WH] ✅ DELIVERED to ${url} (status=${result.status}, attempt=${attempt})`);
+        state.metrics.webhook_deliveries++;
+        return true;
+      }
+
+      console.log(`[WH] ${url} -> ${result.status} body="${(result.body || '').slice(0, 200)}" attempt #${attempt}`);
+
+      // Follow redirects manually (preserving POST method)
+      if ([301, 302, 307, 308].includes(result.status) && result.location) {
+        console.log(`[WH] Following redirect to ${result.location}`);
+        url = result.location;
+        continue;
+      }
+
+      if (result.status === 500 || result.status === 502 || result.status === 503 || result.status === 504) {
+        await sleep(1000);
+        continue;
+      }
+
+      // Non-transient, non-redirect — stop
+      return false;
+
+    } catch (err) {
+      console.log(`[WH] ${url} -> ERROR ${err.code || err.message}, retry #${attempt}`);
+      await sleep(1000);
+    }
+  }
+
+  console.log(`[WH] ❌ FAILED ${url} after max attempts`);
+  return false;
+}
+
+/**
+ * Build Slack attachment payload per PDF spec
+ */
+function buildSlackPayload(alertObj, integration) {
+  const isFired = !!alertObj.fired_at && alertObj.status !== 'resolved';
+  const ts = Math.floor(new Date(alertObj.fired_at || new Date()).getTime() / 1000);
 
   return {
     username: integration.username || 'ProxyWatch',
     text: isFired
-      ? `Alert Fired: Proxy pool failure rate (${fullAlert.failure_rate}) exceeded threshold (${fullAlert.threshold})`
-      : `Alert Resolved: Alert ${fullAlert.alert_id} has been resolved`,
+      ? `Alert Fired: Proxy pool failure rate (${alertObj.failure_rate}) exceeded threshold (${alertObj.threshold})`
+      : `Alert Resolved: Alert ${alertObj.alert_id} has been resolved`,
     attachments: [{
       color: isFired ? '#FF0000' : '#36A64F',
       fields: [
-        { title: 'Alert ID', value: String(fullAlert.alert_id || '') },
-        { title: 'Failure Rate', value: String(fullAlert.failure_rate != null ? fullAlert.failure_rate : '') },
-        { title: 'Failed Proxies', value: String(fullAlert.failed_proxies != null ? fullAlert.failed_proxies : '') },
-        { title: 'Threshold', value: String(fullAlert.threshold != null ? fullAlert.threshold : '0.2') },
-        { title: 'Failed IDs', value: String((fullAlert.failed_proxy_ids || []).join(', ') || 'None') },
-        { title: 'Fired At', value: String(fullAlert.fired_at || '') }
+        { title: 'Alert ID', value: String(alertObj.alert_id) },
+        { title: 'Failure Rate', value: String(alertObj.failure_rate) },
+        { title: 'Failed Proxies', value: String(alertObj.failed_proxies) },
+        { title: 'Threshold', value: String(alertObj.threshold) },
+        { title: 'Failed IDs', value: (alertObj.failed_proxy_ids || []).join(', ') || 'None' },
+        { title: 'Fired At', value: String(alertObj.fired_at) }
       ],
       footer: 'ProxyMaze Alert System',
       ts: ts
@@ -163,24 +136,24 @@ function formatSlackPayload(payload, fullAlert, integration) {
 }
 
 /**
- * Format a Discord-style webhook payload
+ * Build Discord embed payload per PDF spec
  */
-function formatDiscordPayload(payload, fullAlert, integration) {
-  const isFired = payload.event === 'alert.fired';
+function buildDiscordPayload(alertObj, integration) {
+  const isFired = !!alertObj.fired_at && alertObj.status !== 'resolved';
 
   return {
     embeds: [{
       title: isFired ? 'Alert Fired' : 'Alert Resolved',
       description: isFired
-        ? `Proxy pool failure rate (${fullAlert.failure_rate}) exceeded threshold (${fullAlert.threshold})`
-        : `Alert ${fullAlert.alert_id} has been resolved`,
+        ? `Proxy pool failure rate (${alertObj.failure_rate}) exceeded threshold (${alertObj.threshold})`
+        : `Alert ${alertObj.alert_id} has been resolved`,
       color: isFired ? 16711680 : 65280,
       fields: [
-        { name: 'Alert ID', value: String(fullAlert.alert_id || '') },
-        { name: 'Failure Rate', value: String(fullAlert.failure_rate != null ? fullAlert.failure_rate : '') },
-        { name: 'Failed Proxies', value: String(fullAlert.failed_proxies != null ? fullAlert.failed_proxies : '') },
-        { name: 'Threshold', value: String(fullAlert.threshold != null ? fullAlert.threshold : '0.2') },
-        { name: 'Failed IDs', value: String((fullAlert.failed_proxy_ids || []).join(', ') || 'None') }
+        { name: 'Alert ID', value: String(alertObj.alert_id) },
+        { name: 'Failure Rate', value: String(alertObj.failure_rate) },
+        { name: 'Failed Proxies', value: String(alertObj.failed_proxies) },
+        { name: 'Threshold', value: String(alertObj.threshold) },
+        { name: 'Failed IDs', value: (alertObj.failed_proxy_ids || []).join(', ') || 'None' }
       ],
       footer: { text: 'ProxyMaze Alert System' }
     }]
@@ -188,33 +161,93 @@ function formatDiscordPayload(payload, fullAlert, integration) {
 }
 
 /**
- * Dispatch an alert event to all registered webhooks and integrations.
+ * Dispatch webhook event. Exactly-once per (url, event, alert_id).
+ * Runs in background — does NOT block the caller.
  */
-function dispatchWebhooks(payload) {
-  // Grab the full alert state for Slack/Discord which need missing fields
-  const fullAlert = state.alerts.find(a => a.alert_id === payload.alert_id) || payload;
+function dispatchWebhooks(eventPayload) {
+  console.log(`[WH] DISPATCH ${eventPayload.event} | alert=${eventPayload.alert_id} | webhooks=${state.webhooks.length} integrations=${state.integrations.length}`);
 
-  // Enforce strict ISO string format without milliseconds for the JSON payloads
-  if (payload.fired_at) payload.fired_at = getStrictIsoTimestamp(payload.fired_at);
-  if (payload.resolved_at) payload.resolved_at = getStrictIsoTimestamp(payload.resolved_at);
-  if (fullAlert && fullAlert.fired_at) fullAlert.fired_at = getStrictIsoTimestamp(fullAlert.fired_at);
+  // Find the full alert object for Slack/Discord payloads
+  const fullAlert = state.alerts.find(a => a.alert_id === eventPayload.alert_id) || {};
 
-  const uniqueWebhooks = [...new Map(state.webhooks.map(wh => [wh.url, wh])).values()];
-  const uniqueIntegrations = [...new Map(state.integrations.map(int => [int.webhook_url, int])).values()];
+  // Regular webhooks
+  for (const wh of state.webhooks) {
+    const key = `${wh.url}|${eventPayload.event}|${eventPayload.alert_id}`;
+    if (state.deliveredKeys.has(key)) {
+      console.log(`[WH] SKIP duplicate: ${key}`);
+      continue;
+    }
+    // Mark as in-flight immediately to prevent duplicates from sustained breach cycles
+    state.deliveredKeys.add(key);
 
-  for (const wh of uniqueWebhooks) {
-    enqueueDelivery(wh.url, payload);
+    deliverWithRetry(wh.url, eventPayload).catch(err => {
+      console.log(`[WH] delivery error: ${err.message}`);
+    });
   }
 
-  for (const integration of uniqueIntegrations) {
-    if (!integration.events || integration.events.includes(payload.event)) {
-      if (integration.type === 'slack') {
-        enqueueDelivery(integration.webhook_url, formatSlackPayload(payload, fullAlert, integration));
-      } else if (integration.type === 'discord') {
-        enqueueDelivery(integration.webhook_url, formatDiscordPayload(payload, fullAlert, integration));
-      }
-    }
+  // Slack integrations
+  for (const int of state.integrations) {
+    if (int.type !== 'slack') continue;
+    if (int.events && !int.events.includes(eventPayload.event)) continue;
+
+    const key = `${int.webhook_url}|slack|${eventPayload.event}|${eventPayload.alert_id}`;
+    if (state.deliveredKeys.has(key)) continue;
+    state.deliveredKeys.add(key);
+
+    const slackPayload = buildSlackPayload(fullAlert, int);
+    deliverWithRetry(int.webhook_url, slackPayload).catch(() => {});
+  }
+
+  // Discord integrations
+  for (const int of state.integrations) {
+    if (int.type !== 'discord') continue;
+    if (int.events && !int.events.includes(eventPayload.event)) continue;
+
+    const key = `${int.webhook_url}|discord|${eventPayload.event}|${eventPayload.alert_id}`;
+    if (state.deliveredKeys.has(key)) continue;
+    state.deliveredKeys.add(key);
+
+    const discordPayload = buildDiscordPayload(fullAlert, int);
+    deliverWithRetry(int.webhook_url, discordPayload).catch(() => {});
   }
 }
 
-module.exports = { dispatchWebhooks };
+/**
+ * Send the current active alert to a newly-registered integration.
+ * Called from POST /integrations when an alert is already active.
+ */
+function dispatchToNewIntegration(integration, activeAlert) {
+  const eventPayload = {
+    event: 'alert.fired',
+    alert_id: activeAlert.alert_id,
+    fired_at: activeAlert.fired_at,
+    failure_rate: activeAlert.failure_rate,
+    total_proxies: activeAlert.total_proxies,
+    failed_proxies: activeAlert.failed_proxies,
+    failed_proxy_ids: [...activeAlert.failed_proxy_ids],
+    threshold: activeAlert.threshold,
+    message: activeAlert.message
+  };
+
+  if (integration.events && !integration.events.includes('alert.fired')) return;
+
+  if (integration.type === 'slack') {
+    const key = `${integration.webhook_url}|slack|alert.fired|${activeAlert.alert_id}`;
+    if (state.deliveredKeys.has(key)) return;
+    state.deliveredKeys.add(key);
+
+    const slackPayload = buildSlackPayload(activeAlert, integration);
+    console.log(`[INT] Dispatching Slack alert.fired to ${integration.webhook_url}`);
+    deliverWithRetry(integration.webhook_url, slackPayload).catch(() => {});
+  } else if (integration.type === 'discord') {
+    const key = `${integration.webhook_url}|discord|alert.fired|${activeAlert.alert_id}`;
+    if (state.deliveredKeys.has(key)) return;
+    state.deliveredKeys.add(key);
+
+    const discordPayload = buildDiscordPayload(activeAlert, integration);
+    console.log(`[INT] Dispatching Discord alert.fired to ${integration.webhook_url}`);
+    deliverWithRetry(integration.webhook_url, discordPayload).catch(() => {});
+  }
+}
+
+module.exports = { dispatchWebhooks, dispatchToNewIntegration };

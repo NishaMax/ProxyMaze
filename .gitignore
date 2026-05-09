@@ -25,3 +25,11 @@ Thumbs.db
 # Build
 dist/
 build/
+
+# Cloudflare tunnel binary
+cloudflared.exe
+cloudflared
+
+# Temp/test files
+pdf_content.txt
+manual_test_*.js

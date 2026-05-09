@@ -4,39 +4,23 @@
 // ─────────────────────────────────────────────
 
 const state = {
-  // ─── Runtime Config ───
   config: {
     check_interval_seconds: 30,
     request_timeout_ms: 5000
   },
 
-  // ─── Proxy Pool ───
-  // Map<proxyId, ProxyEntry>
-  // ProxyEntry = {
-  //   id, url, status ("pending"|"up"|"down"),
-  //   last_checked_at, consecutive_failures,
-  //   total_checks, up_count, history[]
-  // }
   proxyPool: new Map(),
 
-  // ─── Alerts ───
-  alerts: [],          // Full archive (active + resolved)
-  activeAlert: null,   // Reference to current active alert or null
+  alerts: [],
+  activeAlert: null,
 
-  // ─── Webhooks ───
-  webhooks: [],        // [{ webhook_id, url }]
+  webhooks: [],
+  integrations: [],
 
-  // ─── Integrations ───
-  integrations: [],    // [{ type, webhook_url, username, events }]
+  // Track which (url + event + alert_id) combos have been successfully delivered
+  // to guarantee exactly-once delivery
+  deliveredKeys: new Set(),
 
-  // ─── Reliable delivery (in-memory) ───
-  // deliveryQueue: Map<deliveryKey, {url,payload,created_at_ms,next_attempt_at_ms,attempts,status}>
-  deliveryQueue: new Map(),
-  // deliverySuccessKeys: Set<deliveryKey>
-  deliverySuccessKeys: new Set(),
-  _dispatcherLoopStarted: false,
-
-  // ─── Metrics ───
   metrics: {
     total_checks: 0,
     webhook_deliveries: 0

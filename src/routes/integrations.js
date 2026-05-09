@@ -5,6 +5,7 @@
 
 const { Router } = require('express');
 const state = require('../store/state');
+const { dispatchToNewIntegration } = require('../engine/webhookDispatcher');
 
 const router = Router();
 
@@ -24,6 +25,13 @@ router.post('/integrations', (req, res) => {
   };
 
   state.integrations.push(integration);
+  console.log(`[INT] Registered ${type} integration: ${webhook_url}`);
+
+  // If there's a currently active alert, immediately dispatch to this new integration
+  if (state.activeAlert) {
+    console.log(`[INT] Active alert exists (${state.activeAlert.alert_id}), dispatching to new ${type} integration`);
+    dispatchToNewIntegration(integration, state.activeAlert);
+  }
 
   res.status(201).json(integration);
 });

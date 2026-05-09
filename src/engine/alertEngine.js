@@ -7,25 +7,23 @@ const crypto = require('crypto');
 const state = require('../store/state');
 const { dispatchWebhooks } = require('./webhookDispatcher');
 
-/**
- * Evaluate alert conditions after each monitoring cycle.
- * SYNCHRONOUS — webhooks are dispatched in the background.
- */
 function evaluateAlerts() {
   const proxies = [...state.proxyPool.values()];
   const total = proxies.length;
-
   if (total === 0) return;
 
-  const checkedProxies = proxies.filter(p => p.status === 'up' || p.status === 'down');
-  if (checkedProxies.length === 0) return;
+  // Wait until at least one proxy has been checked
+  if (!proxies.some(p => p.status === 'up' || p.status === 'down')) return;
 
-  const downCount = proxies.filter(p => p.status === 'down').length;
+  const downProxies = proxies.filter(p => p.status === 'down');
+  const downCount = downProxies.length;
   const failureRate = downCount / total;
-  const failedIds = proxies.filter(p => p.status === 'down').map(p => p.id);
+  const failedIds = downProxies.map(p => p.id);
+
+  console.log(`[ALERT] evaluate: ${downCount}/${total} down (rate=${failureRate.toFixed(3)}) activeAlert=${state.activeAlert?.alert_id || 'none'}`);
 
   if (failureRate >= 0.20 && !state.activeAlert) {
-    // ── 🔥 FIRE new alert ──
+    // ── FIRE ──
     const now = new Date().toISOString();
     const alert = {
       alert_id: `alert-${crypto.randomUUID().slice(0, 8)}`,
@@ -43,6 +41,8 @@ function evaluateAlerts() {
     state.alerts.push(alert);
     state.activeAlert = alert;
 
+    console.log(`[ALERT] 🔥 FIRED ${alert.alert_id} rate=${failureRate} failed=[${failedIds}]`);
+
     dispatchWebhooks({
       event: 'alert.fired',
       alert_id: alert.alert_id,
@@ -56,14 +56,14 @@ function evaluateAlerts() {
     });
 
   } else if (failureRate >= 0.20 && state.activeAlert) {
-    // ── 🔄 Breach continues — update existing alert, NO new webhook ──
+    // ── SUSTAIN — update stats, NO new webhook ──
     state.activeAlert.failure_rate = failureRate;
     state.activeAlert.failed_proxies = downCount;
     state.activeAlert.failed_proxy_ids = [...failedIds];
     state.activeAlert.total_proxies = total;
 
   } else if (failureRate < 0.20 && state.activeAlert) {
-    // ── ✅ RESOLVE ──
+    // ── RESOLVE ──
     const now = new Date().toISOString();
     state.activeAlert.status = 'resolved';
     state.activeAlert.resolved_at = now;
@@ -71,15 +71,16 @@ function evaluateAlerts() {
     state.activeAlert.failed_proxies = downCount;
     state.activeAlert.failed_proxy_ids = [...failedIds];
 
-    const resolvedAlertId = state.activeAlert.alert_id;
-    const resolvedAt = state.activeAlert.resolved_at;
+    const alertId = state.activeAlert.alert_id;
+    const resolvedAt = now;
 
-    state.activeAlert = null; // Clear BEFORE dispatching
+    console.log(`[ALERT] ✅ RESOLVED ${alertId} rate=${failureRate}`);
 
-    // MUST match EXACTLY the 3 fields requested by the PDF
+    state.activeAlert = null;
+
     dispatchWebhooks({
       event: 'alert.resolved',
-      alert_id: resolvedAlertId,
+      alert_id: alertId,
       resolved_at: resolvedAt
     });
   }

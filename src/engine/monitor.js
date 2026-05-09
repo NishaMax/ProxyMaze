@@ -1,6 +1,6 @@
 // ─────────────────────────────────────────────
 // src/engine/monitor.js
-// Background monitoring loop — the heart of ProxyMaze
+// Background monitoring loop
 // ─────────────────────────────────────────────
 
 const axios = require('axios');
@@ -15,26 +15,23 @@ async function probeProxy(proxy) {
   const timeoutMs = Number(state.config.request_timeout_ms) || 5000;
 
   try {
-    const response = await axios.get(proxy.url, {
+    const res = await axios.get(proxy.url, {
       timeout: timeoutMs,
       validateStatus: () => true,
-      maxRedirects: 5,
-      responseType: 'text',
-      maxContentLength: 1024 * 10
+      maxRedirects: 5
     });
 
-    // Evaluator contract: only 2xx counts as "up".
-    // Any timeout/connection failure OR any non-2xx status counts as "down".
-    if (response.status >= 200 && response.status < 300) {
+    if (res.status >= 200 && res.status < 300) {
       proxy.status = 'up';
       proxy.consecutive_failures = 0;
       proxy.up_count++;
     } else {
+      // Any non-2xx (including 5xx) → down
       proxy.status = 'down';
       proxy.consecutive_failures++;
     }
   } catch (err) {
-    // Any timeout/connection/DNS/etc => down
+    // Timeout, connection refused, DNS failure → down
     proxy.status = 'down';
     proxy.consecutive_failures++;
   }
@@ -53,12 +50,17 @@ async function runMonitoringCycle() {
 
   try {
     const proxies = [...state.proxyPool.values()];
-    await Promise.all(proxies.map(proxy => probeProxy(proxy)));
+    console.log(`[MON] Probing ${proxies.length} proxies...`);
 
-    // Synchronous evaluateAlerts so we don't block the next monitoring cycle
+    await Promise.all(proxies.map(p => probeProxy(p)));
+
+    const up = proxies.filter(p => p.status === 'up').length;
+    const down = proxies.filter(p => p.status === 'down').length;
+    console.log(`[MON] Done: up=${up} down=${down}`);
+
     evaluateAlerts();
   } catch (err) {
-    console.error(`[Monitor] Cycle error: ${err.message}`);
+    console.error(`[MON] Cycle error: ${err.message}`);
   } finally {
     isRunningCycle = false;
   }
@@ -71,20 +73,14 @@ function restartMonitoringLoop() {
   }
 
   const intervalMs = (Number(state.config.check_interval_seconds) || 15) * 1000;
+  console.log(`[MON] Loop started: interval=${intervalMs}ms timeout=${state.config.request_timeout_ms}ms`);
 
   runMonitoringCycle();
-  monitoringInterval = setInterval(() => {
-    runMonitoringCycle();
-  }, intervalMs);
+  monitoringInterval = setInterval(() => runMonitoringCycle(), intervalMs);
 }
 
 function triggerImmediateCycle() {
-  if (isRunningCycle) {
-    // If a cycle is running, try again shortly to ensure newly added proxies are caught quickly
-    setTimeout(triggerImmediateCycle, 200);
-  } else {
-    setTimeout(() => runMonitoringCycle(), 10);
-  }
+  setTimeout(() => runMonitoringCycle(), 50);
 }
 
 module.exports = { restartMonitoringLoop, triggerImmediateCycle };
