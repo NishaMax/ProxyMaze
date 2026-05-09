@@ -76,6 +76,7 @@ function ensureDispatcherLoop() {
     const pendingKeys = [];
     for (const [k, job] of state.deliveryQueue.entries()) {
       if (!job || job.status !== 'pending') continue;
+      if (job.in_flight) continue;
       if (job.next_attempt_at_ms && job.next_attempt_at_ms > now) continue;
       pendingKeys.push(k);
       if (pendingKeys.length >= batchSize) break;
@@ -84,25 +85,31 @@ function ensureDispatcherLoop() {
     for (const key of pendingKeys) {
       const job = state.deliveryQueue.get(key);
       if (!job || job.status !== 'pending') continue;
+      if (job.in_flight) continue;
 
       // Guard against long-lived jobs: stop trying after 60s window
-      if (now - job.created_at_ms > 60_000) {
-        job.status = 'expired';
+      if (Date.now() - job.created_at_ms > 60_000) {
+        state.deliveryQueue.delete(key);
         continue;
       }
 
+      job.in_flight = true;
+
       const result = await attemptOnce(job.url, job.payload);
       if (result.ok) {
-        job.status = 'delivered';
         if (!state.deliverySuccessKeys.has(key)) {
           state.deliverySuccessKeys.add(key);
           state.metrics.webhook_deliveries++;
         }
+        // Remove job after success to avoid any future processing
+        state.deliveryQueue.delete(key);
       } else if (result.transient) {
         job.attempts++;
         job.next_attempt_at_ms = Date.now() + 1500;
+        job.in_flight = false;
       } else {
-        job.status = 'failed';
+        // Terminal failure; remove so it can't deliver duplicates later
+        state.deliveryQueue.delete(key);
       }
     }
   }, 250);
@@ -121,7 +128,8 @@ function enqueueDelivery(url, payload) {
     created_at_ms: Date.now(),
     next_attempt_at_ms: Date.now(),
     attempts: 0,
-    status: 'pending'
+    status: 'pending',
+    in_flight: false
   });
 }
 
