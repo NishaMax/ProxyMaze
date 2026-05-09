@@ -10,6 +10,7 @@
 const { Router } = require('express');
 const state = require('../store/state');
 const { extractProxyId } = require('../utils/proxyId');
+const { triggerImmediateCycle } = require('../engine/monitor');
 
 const router = Router();
 
@@ -46,10 +47,15 @@ router.post('/proxies', (req, res) => {
     accepted.push({ id, url, status: 'pending' });
   }
 
+  // Respond immediately with pending status
   res.status(201).json({
     accepted: accepted.length,
     proxies: accepted
   });
+
+  // Trigger an immediate monitoring cycle so proxies transition
+  // from "pending" to "up"/"down" without waiting for the next interval
+  triggerImmediateCycle();
 });
 
 // GET /proxies — Pool overview with failure_rate

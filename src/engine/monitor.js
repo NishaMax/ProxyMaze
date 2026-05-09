@@ -8,6 +8,7 @@ const state = require('../store/state');
 const { evaluateAlerts } = require('./alertEngine');
 
 let monitoringInterval = null;
+let isRunningCycle = false; // Guard against concurrent cycles
 
 /**
  * Probe a single proxy URL.
@@ -20,7 +21,8 @@ async function probeProxy(proxy) {
   try {
     const response = await axios.get(proxy.url, {
       timeout: state.config.request_timeout_ms,
-      validateStatus: () => true // Don't throw on any HTTP status
+      validateStatus: () => true, // Don't throw on any HTTP status
+      maxRedirects: 5
     });
 
     if (response.status >= 200 && response.status < 300) {
@@ -57,19 +59,28 @@ async function probeProxy(proxy) {
  */
 async function runMonitoringCycle() {
   if (state.proxyPool.size === 0) return;
+  if (isRunningCycle) return; // Prevent overlapping cycles
 
-  const proxies = [...state.proxyPool.values()];
+  isRunningCycle = true;
 
-  console.log(`[Monitor] Probing ${proxies.length} proxies...`);
+  try {
+    const proxies = [...state.proxyPool.values()];
 
-  // Probe all proxies concurrently
-  await Promise.all(proxies.map(proxy => probeProxy(proxy)));
+    console.log(`[Monitor] Probing ${proxies.length} proxies...`);
 
-  // Evaluate alert conditions
-  evaluateAlerts();
+    // Probe all proxies concurrently
+    await Promise.all(proxies.map(proxy => probeProxy(proxy)));
 
-  const downCount = proxies.filter(p => p.status === 'down').length;
-  console.log(`[Monitor] Cycle complete — up: ${proxies.length - downCount}, down: ${downCount}`);
+    // Evaluate alert conditions
+    evaluateAlerts();
+
+    const downCount = proxies.filter(p => p.status === 'down').length;
+    console.log(`[Monitor] Cycle complete — up: ${proxies.length - downCount}, down: ${downCount}`);
+  } catch (err) {
+    console.error(`[Monitor] Cycle error: ${err.message}`);
+  } finally {
+    isRunningCycle = false;
+  }
 }
 
 /**
@@ -86,7 +97,7 @@ function restartMonitoringLoop() {
 
   console.log(`[Monitor] Starting loop — interval: ${state.config.check_interval_seconds}s, timeout: ${state.config.request_timeout_ms}ms`);
 
-  // Run first cycle immediately, then on interval
+  // Run first cycle immediately (picks up any existing proxies)
   runMonitoringCycle();
 
   monitoringInterval = setInterval(() => {
@@ -94,4 +105,12 @@ function restartMonitoringLoop() {
   }, intervalMs);
 }
 
-module.exports = { restartMonitoringLoop };
+/**
+ * Trigger an immediate monitoring cycle (e.g., when proxies are loaded).
+ * Does not restart the interval — just runs one cycle now.
+ */
+function triggerImmediateCycle() {
+  runMonitoringCycle();
+}
+
+module.exports = { restartMonitoringLoop, triggerImmediateCycle };

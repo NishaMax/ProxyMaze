@@ -20,6 +20,22 @@ app.use(require('./src/routes/webhooks'));
 app.use(require('./src/routes/integrations'));
 app.use(require('./src/routes/metrics'));
 
+// ─── Global Error Handler ───
+// Catches any unhandled errors so the server never crashes
+app.use((err, req, res, next) => {
+  console.error(`[Server] Unhandled error: ${err.message}`);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+// ─── Catch unhandled promise rejections ───
+process.on('unhandledRejection', (reason) => {
+  console.error('[Server] Unhandled promise rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[Server] Uncaught exception:', err.message);
+});
+
 // ─── Start Server ───
 const PORT = process.env.PORT || 3000;
 
