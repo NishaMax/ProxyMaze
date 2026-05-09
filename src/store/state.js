@@ -29,6 +29,13 @@ const state = {
   // ─── Integrations ───
   integrations: [],    // [{ type, webhook_url, username, events }]
 
+  // ─── Reliable delivery (in-memory) ───
+  // deliveryQueue: Map<deliveryKey, {url,payload,created_at_ms,next_attempt_at_ms,attempts,status}>
+  deliveryQueue: new Map(),
+  // deliverySuccessKeys: Set<deliveryKey>
+  deliverySuccessKeys: new Set(),
+  _dispatcherLoopStarted: false,
+
   // ─── Metrics ───
   metrics: {
     total_checks: 0,

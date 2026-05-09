@@ -5,6 +5,7 @@
 
 const axios = require('axios');
 const https = require('https');
+const crypto = require('crypto');
 const state = require('../store/state');
 
 // Ignore self-signed certificates in case the evaluator uses them
@@ -20,42 +21,111 @@ function getStrictIsoTimestamp(dateStr) {
   return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
 }
 
-/**
- * Deliver a payload to a URL with retry on 500/502/503/504.
- * Must succeed within 60 seconds of the state transition.
- */
-async function deliverWithRetry(url, payload) {
-  const maxAttempts = 20;
-  const retryDelayMs = 1500;
+function stableStringify(obj) {
+  // Stable enough for our payload hashing needs (sorted keys)
+  if (obj === null || typeof obj !== 'object') return JSON.stringify(obj);
+  if (Array.isArray(obj)) return `[${obj.map(stableStringify).join(',')}]`;
+  const keys = Object.keys(obj).sort();
+  return `{${keys.map(k => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(',')}}`;
+}
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      const res = await axios.post(url, payload, {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 8000,
-        validateStatus: () => true,
-        maxRedirects: 5,
-        httpsAgent
-      });
+function computeDeliveryKey(url, payload) {
+  const event = payload?.event || '';
+  const alertId = payload?.alert_id || '';
+  // If an event has no alert_id (shouldn't happen), fall back to hashing payload
+  const base = `${url}|${event}|${alertId || crypto.createHash('sha1').update(stableStringify(payload)).digest('hex')}`;
+  return base;
+}
 
-      if ([500, 502, 503, 504].includes(res.status)) {
-        if (attempt < maxAttempts) await sleep(retryDelayMs);
+function isTransientStatus(status) {
+  return [500, 502, 503, 504].includes(status);
+}
+
+async function attemptOnce(url, payload) {
+  const res = await axios.post(url, payload, {
+    headers: { 'Content-Type': 'application/json' },
+    timeout: 8000,
+    validateStatus: () => true,
+    maxRedirects: 5,
+    httpsAgent
+  });
+
+  if (isTransientStatus(res.status)) return { ok: false, transient: true, status: res.status };
+  if (res.status >= 200 && res.status < 300) return { ok: true, transient: false, status: res.status };
+
+  // Non-transient failure: do not retry forever (contract only mandates retry on transient 5xx)
+  return { ok: false, transient: false, status: res.status };
+}
+
+function ensureDispatcherLoop() {
+  if (state._dispatcherLoopStarted) return;
+  state._dispatcherLoopStarted = true;
+
+  setInterval(async () => {
+    // Process a small batch frequently so we meet the 60s requirement.
+    const batchSize = 25;
+    const now = Date.now();
+
+    const pendingKeys = [];
+    for (const [k, job] of state.deliveryQueue.entries()) {
+      if (!job || job.status !== 'pending') continue;
+      if (job.next_attempt_at_ms && job.next_attempt_at_ms > now) continue;
+      pendingKeys.push(k);
+      if (pendingKeys.length >= batchSize) break;
+    }
+
+    for (const key of pendingKeys) {
+      const job = state.deliveryQueue.get(key);
+      if (!job || job.status !== 'pending') continue;
+
+      // Guard against long-lived jobs: stop trying after 60s window
+      if (now - job.created_at_ms > 60_000) {
+        job.status = 'expired';
         continue;
       }
 
-      state.metrics.webhook_deliveries++;
-      return true;
-
-    } catch (err) {
-      if (attempt < maxAttempts) await sleep(retryDelayMs);
+      try {
+        const result = await attemptOnce(job.url, job.payload);
+        if (result.ok) {
+          job.status = 'delivered';
+          if (!state.deliverySuccessKeys.has(key)) {
+            state.deliverySuccessKeys.add(key);
+            state.metrics.webhook_deliveries++;
+          }
+        } else if (result.transient) {
+          job.attempts++;
+          job.next_attempt_at_ms = Date.now() + 1500;
+        } else {
+          job.status = 'failed';
+        }
+      } catch (e) {
+        // Network errors behave like transient; retry
+        job.attempts++;
+        job.next_attempt_at_ms = Date.now() + 1500;
+      }
     }
-  }
+  }, 250);
+}
 
-  return false;
+function enqueueDelivery(url, payload) {
+  ensureDispatcherLoop();
+
+  const key = computeDeliveryKey(url, payload);
+  if (state.deliverySuccessKeys.has(key)) return;
+  if (state.deliveryQueue.has(key)) return;
+
+  state.deliveryQueue.set(key, {
+    url,
+    payload,
+    created_at_ms: Date.now(),
+    next_attempt_at_ms: Date.now(),
+    attempts: 0,
+    status: 'pending'
+  });
 }
 
 /**
- * Format a Slack-style webhook payload
+ * Format a Slack-style webhook payload (legacy attachments format per challenge spec)
  */
 function formatSlackPayload(payload, fullAlert, integration) {
   const timestamp = payload.fired_at || payload.resolved_at || fullAlert.fired_at || new Date().toISOString();
@@ -110,7 +180,6 @@ function formatDiscordPayload(payload, fullAlert, integration) {
 
 /**
  * Dispatch an alert event to all registered webhooks and integrations.
- * Runs entirely in the background (fire-and-forget).
  */
 function dispatchWebhooks(payload) {
   // Grab the full alert state for Slack/Discord which need missing fields
@@ -121,24 +190,19 @@ function dispatchWebhooks(payload) {
   if (payload.resolved_at) payload.resolved_at = getStrictIsoTimestamp(payload.resolved_at);
   if (fullAlert && fullAlert.fired_at) fullAlert.fired_at = getStrictIsoTimestamp(fullAlert.fired_at);
 
-  // Deduplicate webhooks to prevent multiple deliveries if registered multiple times
   const uniqueWebhooks = [...new Map(state.webhooks.map(wh => [wh.url, wh])).values()];
   const uniqueIntegrations = [...new Map(state.integrations.map(int => [int.webhook_url, int])).values()];
 
-  // Regular webhooks
   for (const wh of uniqueWebhooks) {
-    deliverWithRetry(wh.url, payload).catch(() => {});
+    enqueueDelivery(wh.url, payload);
   }
 
-  // Integrations
   for (const integration of uniqueIntegrations) {
     if (!integration.events || integration.events.includes(payload.event)) {
       if (integration.type === 'slack') {
-        const slackPayload = formatSlackPayload(payload, fullAlert, integration);
-        deliverWithRetry(integration.webhook_url, slackPayload).catch(() => {});
+        enqueueDelivery(integration.webhook_url, formatSlackPayload(payload, fullAlert, integration));
       } else if (integration.type === 'discord') {
-        const discordPayload = formatDiscordPayload(payload, fullAlert, integration);
-        deliverWithRetry(integration.webhook_url, discordPayload).catch(() => {});
+        enqueueDelivery(integration.webhook_url, formatDiscordPayload(payload, fullAlert, integration));
       }
     }
   }
