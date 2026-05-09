@@ -23,21 +23,15 @@ async function probeProxy(proxy) {
       maxContentLength: 1024 * 10
     });
 
-    // Spec:
-    // - 2xx within timeout => up
-    // - timeout/connection failure/connection refused OR any 5xx => down
+    // Evaluator contract: only 2xx counts as "up".
+    // Any timeout/connection failure OR any non-2xx status counts as "down".
     if (response.status >= 200 && response.status < 300) {
       proxy.status = 'up';
       proxy.consecutive_failures = 0;
       proxy.up_count++;
-    } else if (response.status >= 500 && response.status < 600) {
+    } else {
       proxy.status = 'down';
       proxy.consecutive_failures++;
-    } else {
-      // Treat other non-2xx (3xx/4xx) as "up" for this challenge so only true server failures count as down.
-      proxy.status = 'up';
-      proxy.consecutive_failures = 0;
-      proxy.up_count++;
     }
   } catch (err) {
     // Any timeout/connection/DNS/etc => down
