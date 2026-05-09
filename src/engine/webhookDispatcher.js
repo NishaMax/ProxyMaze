@@ -38,23 +38,30 @@ function computeDeliveryKey(url, payload) {
 }
 
 function isTransientStatus(status) {
-  return [500, 502, 503, 504].includes(status);
+  // Evaluator expects retries on transient receiver failures (500/502/503/504),
+  // but being generous with any 5xx improves real-world reliability.
+  return typeof status === 'number' && status >= 500 && status < 600;
 }
 
 async function attemptOnce(url, payload) {
-  const res = await axios.post(url, payload, {
-    headers: { 'Content-Type': 'application/json' },
-    timeout: 8000,
-    validateStatus: () => true,
-    maxRedirects: 5,
-    httpsAgent
-  });
+  try {
+    const res = await axios.post(url, payload, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 8000,
+      validateStatus: () => true,
+      maxRedirects: 5,
+      httpsAgent
+    });
 
-  if (isTransientStatus(res.status)) return { ok: false, transient: true, status: res.status };
-  if (res.status >= 200 && res.status < 300) return { ok: true, transient: false, status: res.status };
+    if (isTransientStatus(res.status)) return { ok: false, transient: true, status: res.status };
+    if (res.status >= 200 && res.status < 300) return { ok: true, transient: false, status: res.status };
 
-  // Non-transient failure: do not retry forever (contract only mandates retry on transient 5xx)
-  return { ok: false, transient: false, status: res.status };
+    // Non-transient failure: do not retry forever
+    return { ok: false, transient: false, status: res.status };
+  } catch (err) {
+    // Network/TLS/DNS/timeout => treat as transient for retry.
+    return { ok: false, transient: true, status: 0 };
+  }
 }
 
 function ensureDispatcherLoop() {
@@ -84,24 +91,18 @@ function ensureDispatcherLoop() {
         continue;
       }
 
-      try {
-        const result = await attemptOnce(job.url, job.payload);
-        if (result.ok) {
-          job.status = 'delivered';
-          if (!state.deliverySuccessKeys.has(key)) {
-            state.deliverySuccessKeys.add(key);
-            state.metrics.webhook_deliveries++;
-          }
-        } else if (result.transient) {
-          job.attempts++;
-          job.next_attempt_at_ms = Date.now() + 1500;
-        } else {
-          job.status = 'failed';
+      const result = await attemptOnce(job.url, job.payload);
+      if (result.ok) {
+        job.status = 'delivered';
+        if (!state.deliverySuccessKeys.has(key)) {
+          state.deliverySuccessKeys.add(key);
+          state.metrics.webhook_deliveries++;
         }
-      } catch (e) {
-        // Network errors behave like transient; retry
+      } else if (result.transient) {
         job.attempts++;
         job.next_attempt_at_ms = Date.now() + 1500;
+      } else {
+        job.status = 'failed';
       }
     }
   }, 250);

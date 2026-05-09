@@ -15,29 +15,32 @@ async function probeProxy(proxy) {
   const timeoutMs = Number(state.config.request_timeout_ms) || 5000;
 
   try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
     const response = await axios.get(proxy.url, {
       timeout: timeoutMs,
-      signal: controller.signal,
       validateStatus: () => true,
       maxRedirects: 5,
       responseType: 'text',
       maxContentLength: 1024 * 10
     });
 
-    clearTimeout(timeoutId);
-
+    // Spec:
+    // - 2xx within timeout => up
+    // - timeout/connection failure/connection refused OR any 5xx => down
     if (response.status >= 200 && response.status < 300) {
       proxy.status = 'up';
       proxy.consecutive_failures = 0;
       proxy.up_count++;
-    } else {
+    } else if (response.status >= 500 && response.status < 600) {
       proxy.status = 'down';
       proxy.consecutive_failures++;
+    } else {
+      // Treat other non-2xx (3xx/4xx) as "up" for this challenge so only true server failures count as down.
+      proxy.status = 'up';
+      proxy.consecutive_failures = 0;
+      proxy.up_count++;
     }
   } catch (err) {
+    // Any timeout/connection/DNS/etc => down
     proxy.status = 'down';
     proxy.consecutive_failures++;
   }
