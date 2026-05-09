@@ -8,51 +8,40 @@ const state = require('../store/state');
 const { evaluateAlerts } = require('./alertEngine');
 
 let monitoringInterval = null;
-let isRunningCycle = false; // Guard against concurrent cycles
+let isRunningCycle = false;
 
-/**
- * Probe a single proxy URL.
- * - 2xx within timeout → "up"
- * - 5xx, timeout, connection error → "down"
- */
 async function probeProxy(proxy) {
   const now = new Date().toISOString();
-  const timeoutMs = state.config.request_timeout_ms || 5000;
+  const timeoutMs = Number(state.config.request_timeout_ms) || 5000;
 
   try {
-    // Use AbortController for reliable timeout handling
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
     const response = await axios.get(proxy.url, {
       timeout: timeoutMs,
       signal: controller.signal,
-      validateStatus: () => true, // Don't throw on any HTTP status
+      validateStatus: () => true,
       maxRedirects: 5,
-      // Don't try to decompress or parse response body for speed
       responseType: 'text',
-      maxContentLength: 1024 * 10 // 10KB max, we don't need the body
+      maxContentLength: 1024 * 10
     });
 
     clearTimeout(timeoutId);
 
     if (response.status >= 200 && response.status < 300) {
-      // 2xx → UP
       proxy.status = 'up';
       proxy.consecutive_failures = 0;
       proxy.up_count++;
     } else if (response.status >= 500) {
-      // 5xx → DOWN (explicit server error)
       proxy.status = 'down';
       proxy.consecutive_failures++;
     } else {
-      // 3xx, 4xx → treat as UP (spec only lists 5xx as down)
       proxy.status = 'up';
       proxy.consecutive_failures = 0;
       proxy.up_count++;
     }
   } catch (err) {
-    // Timeout, connection refused, DNS failure, abort, etc. → DOWN
     proxy.status = 'down';
     proxy.consecutive_failures++;
   }
@@ -63,32 +52,18 @@ async function probeProxy(proxy) {
   state.metrics.total_checks++;
 }
 
-/**
- * Run one complete monitoring cycle:
- * 1. Probe all proxies concurrently
- * 2. Evaluate alert conditions (may dispatch webhooks)
- */
 async function runMonitoringCycle() {
   if (state.proxyPool.size === 0) return;
-  if (isRunningCycle) return; // Prevent overlapping cycles
+  if (isRunningCycle) return;
 
   isRunningCycle = true;
 
   try {
     const proxies = [...state.proxyPool.values()];
-
-    console.log(`[Monitor] Probing ${proxies.length} proxies...`);
-
-    // Probe all proxies concurrently
     await Promise.all(proxies.map(proxy => probeProxy(proxy)));
 
-    // Evaluate alert conditions (may fire/resolve alerts and dispatch webhooks)
-    // MUST await — webhook delivery happens inside evaluateAlerts
-    await evaluateAlerts();
-
-    const downCount = proxies.filter(p => p.status === 'down').length;
-    const upCount = proxies.filter(p => p.status === 'up').length;
-    console.log(`[Monitor] Cycle complete — up: ${upCount}, down: ${downCount}, pending: ${proxies.length - upCount - downCount}`);
+    // Synchronous evaluateAlerts so we don't block the next monitoring cycle
+    evaluateAlerts();
   } catch (err) {
     console.error(`[Monitor] Cycle error: ${err.message}`);
   } finally {
@@ -96,35 +71,27 @@ async function runMonitoringCycle() {
   }
 }
 
-/**
- * Start or restart the background monitoring loop.
- * Called on startup and when POST /config changes the interval.
- */
 function restartMonitoringLoop() {
   if (monitoringInterval) {
     clearInterval(monitoringInterval);
     monitoringInterval = null;
   }
 
-  const intervalMs = state.config.check_interval_seconds * 1000;
+  const intervalMs = (Number(state.config.check_interval_seconds) || 15) * 1000;
 
-  console.log(`[Monitor] Starting loop — interval: ${state.config.check_interval_seconds}s, timeout: ${state.config.request_timeout_ms}ms`);
-
-  // Run first cycle immediately (picks up any existing proxies)
   runMonitoringCycle();
-
   monitoringInterval = setInterval(() => {
     runMonitoringCycle();
   }, intervalMs);
 }
 
-/**
- * Trigger an immediate monitoring cycle (e.g., when proxies are loaded).
- * Does not restart the interval — just runs one cycle now.
- */
 function triggerImmediateCycle() {
-  // Small delay to let the HTTP response go out first
-  setTimeout(() => runMonitoringCycle(), 100);
+  if (isRunningCycle) {
+    // If a cycle is running, try again shortly to ensure newly added proxies are caught quickly
+    setTimeout(triggerImmediateCycle, 200);
+  } else {
+    setTimeout(() => runMonitoringCycle(), 10);
+  }
 }
 
 module.exports = { restartMonitoringLoop, triggerImmediateCycle };
